@@ -2,6 +2,7 @@
 
 import logging
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import numpy as np
@@ -13,6 +14,7 @@ logger = logging.getLogger(__name__)
 _OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 _REQUEST_TIMEOUT = 10  # seconds
 _HOURS_PER_DAY = 24
+_MAX_STATIONS = 3000   # guard against accidentally huge station lists
 
 # Base temperature offsets by region (°C relative to a mid-summer baseline)
 _REGION_TEMP_OFFSET: dict[str, float] = {
@@ -27,7 +29,6 @@ _REGION_TEMP_OFFSET: dict[str, float] = {
     "沖縄": 4.0,
 }
 
-# Base humidity offsets by region (% relative to a mid-summer baseline)
 _REGION_HUMIDITY_OFFSET: dict[str, float] = {
     "北海道": -10.0,
     "東北": -5.0,
@@ -41,34 +42,24 @@ _REGION_HUMIDITY_OFFSET: dict[str, float] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Core formula
+# ---------------------------------------------------------------------------
+
 def calculate_discomfort_index(temp_c: float, humidity: float) -> float:
-    """Calculate the discomfort index (不快指数) from temperature and humidity.
-
-    Formula: DI = 0.81 * T + 0.01 * U * (0.99 * T - 14.3) + 46.3
-
-    Args:
-        temp_c: Dry-bulb air temperature in degrees Celsius.
-        humidity: Relative humidity in percent (0–100).
-
-    Returns:
-        The discomfort index value (dimensionless).
-    """
+    """DI = 0.81*T + 0.01*U*(0.99*T - 14.3) + 46.3"""
     return 0.81 * temp_c + 0.01 * humidity * (0.99 * temp_c - 14.3) + 46.3
 
 
+# ---------------------------------------------------------------------------
+# Single-location fetch
+# ---------------------------------------------------------------------------
+
 def fetch_weather_for_location(lat: float, lon: float) -> dict | None:
-    """Fetch hourly temperature and humidity for a single location from Open-Meteo.
+    """Fetch 48-hour hourly temperature and humidity from Open-Meteo.
 
-    Args:
-        lat: Latitude of the location.
-        lon: Longitude of the location.
-
-    Returns:
-        A dict with keys:
-            - ``hours``: list of ISO-8601 datetime strings (48 h max)
-            - ``temperature``: list of floats (°C)
-            - ``humidity``: list of floats (%)
-        Returns ``None`` if the request fails or the response is malformed.
+    Returns ``{"hours": [...], "temperature": [...], "humidity": [...]}``
+    or ``None`` on any failure.
     """
     params = {
         "latitude": lat,
@@ -77,174 +68,191 @@ def fetch_weather_for_location(lat: float, lon: float) -> dict | None:
         "forecast_days": 2,
         "timezone": "Asia/Tokyo",
     }
-
     try:
         response = requests.get(_OPEN_METEO_URL, params=params, timeout=_REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json()
-
         hourly = data.get("hourly", {})
-        hours: list[str] = hourly.get("time", [])
-        temperature: list[float] = hourly.get("temperature_2m", [])
-        humidity: list[float] = hourly.get("relative_humidity_2m", [])
-
+        hours       = hourly.get("time", [])
+        temperature = hourly.get("temperature_2m", [])
+        humidity    = hourly.get("relative_humidity_2m", [])
         if not hours or not temperature or not humidity:
             logger.warning("Empty hourly data for lat=%s, lon=%s", lat, lon)
             return None
-
         return {"hours": hours, "temperature": temperature, "humidity": humidity}
-
     except requests.exceptions.Timeout:
-        logger.error("Request timed out for lat=%s, lon=%s", lat, lon)
+        logger.error("Timeout for lat=%s, lon=%s", lat, lon)
     except requests.exceptions.RequestException as exc:
         logger.error("HTTP error for lat=%s, lon=%s: %s", lat, lon, exc)
     except (KeyError, ValueError) as exc:
-        logger.error("Failed to parse response for lat=%s, lon=%s: %s", lat, lon, exc)
-
+        logger.error("Parse error for lat=%s, lon=%s: %s", lat, lon, exc)
     return None
 
+
+# ---------------------------------------------------------------------------
+# Mock data helpers
+# ---------------------------------------------------------------------------
 
 def _make_mock_hours(
     region: str,
     rng: np.random.Generator,
 ) -> tuple[list[float], list[float]]:
-    """Generate 24 hours of mock temperature and humidity for a region.
-
-    Args:
-        region: Japanese region name used to apply climate offsets.
-        rng: NumPy random generator for reproducible noise.
-
-    Returns:
-        A tuple of (temperatures, humidities) each of length 24.
-    """
-    temp_offset = _REGION_TEMP_OFFSET.get(region, 0.0)
+    """Generate 24 hours of synthetic temperature and humidity for a region."""
+    temp_offset     = _REGION_TEMP_OFFSET.get(region, 0.0)
     humidity_offset = _REGION_HUMIDITY_OFFSET.get(region, 0.0)
-
     hours = np.arange(_HOURS_PER_DAY, dtype=float)
 
-    # Daily temperature cycle: coolest around 05:00, hottest around 14:00
-    base_temp = 28.0 + temp_offset
-    temps = base_temp + 5.0 * np.sin((hours - 5.0) / 12.0 * math.pi)
-    temps += rng.uniform(-2.0, 2.0, size=_HOURS_PER_DAY)
+    base_temp  = 28.0 + temp_offset
+    temps      = base_temp + 5.0 * np.sin((hours - 5.0) / 12.0 * math.pi)
+    temps     += rng.uniform(-2.0, 2.0, size=_HOURS_PER_DAY)
 
-    # Humidity is inversely correlated with temperature (higher at night)
-    base_humidity = 70.0 + humidity_offset
-    humidities = base_humidity + 10.0 * np.sin(hours / 8.0 * math.pi)
-    humidities = np.clip(humidities + rng.uniform(-5.0, 5.0, size=_HOURS_PER_DAY), 20.0, 100.0)
-
+    base_hum   = 70.0 + humidity_offset
+    humidities = base_hum + 10.0 * np.sin(hours / 8.0 * math.pi)
+    humidities = np.clip(
+        humidities + rng.uniform(-5.0, 5.0, size=_HOURS_PER_DAY), 20.0, 100.0
+    )
     return temps.tolist(), humidities.tolist()
 
 
+def _build_rows(
+    station: dict,
+    hours_iso: list[str],
+    temperatures: list[float],
+    humidities: list[float],
+) -> list[dict]:
+    """Convert parallel lists into per-hour row dicts."""
+    rows = []
+    for hour_idx, (iso_str, temp, hum) in enumerate(
+        zip(hours_iso, temperatures, humidities)
+    ):
+        rows.append(
+            {
+                "name":             station["name"],
+                "name_en":          station["name_en"],
+                "lat":              station["lat"],
+                "lon":              station["lon"],
+                "region":           station["region"],
+                "hour":             hour_idx,
+                "time":             pd.Timestamp(iso_str),
+                "temperature":      round(float(temp), 1),
+                "humidity":         round(float(hum), 1),
+                "discomfort_index": round(
+                    calculate_discomfort_index(float(temp), float(hum)), 1
+                ),
+            }
+        )
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Sequential fetch (47 prefectures – original)
+# ---------------------------------------------------------------------------
+
 def fetch_all_prefectures(prefectures: list[dict]) -> pd.DataFrame:
-    """Fetch live weather data for all prefectures and return a tidy DataFrame.
-
-    For each prefecture the first 24 hours of forecast data are used. If the
-    API call fails for any location, realistic mock data is substituted so the
-    returned DataFrame always contains a complete set of rows.
-
-    Args:
-        prefectures: List of prefecture dicts with keys ``name``, ``name_en``,
-            ``lat``, ``lon``, and ``region``.
-
-    Returns:
-        A ``pd.DataFrame`` with one row per (prefecture, hour) and columns:
-        ``name``, ``name_en``, ``lat``, ``lon``, ``region``, ``hour``,
-        ``time``, ``temperature``, ``humidity``, ``discomfort_index``.
-    """
-    rng = np.random.default_rng()
+    """Sequential fetch for 47 prefecture capitals."""
+    rng  = np.random.default_rng()
     rows: list[dict] = []
+    today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
 
     for i, pref in enumerate(prefectures, start=1):
-        name: str = pref["name"]
-        logger.info(
-            "Fetching weather [%d/%d]: %s (%s)",
-            i,
-            len(prefectures),
-            name,
-            pref["name_en"],
-        )
-
+        logger.info("Fetching [%d/%d]: %s", i, len(prefectures), pref["name"])
         weather = fetch_weather_for_location(pref["lat"], pref["lon"])
-
         if weather is not None:
-            hours_iso = weather["hours"][:_HOURS_PER_DAY]
+            hours_iso    = weather["hours"][:_HOURS_PER_DAY]
             temperatures = weather["temperature"][:_HOURS_PER_DAY]
-            humidities = weather["humidity"][:_HOURS_PER_DAY]
+            humidities   = weather["humidity"][:_HOURS_PER_DAY]
         else:
-            logger.warning("Using mock data for %s", name)
+            logger.warning("Mock fallback for %s", pref["name"])
             temperatures, humidities = _make_mock_hours(pref["region"], rng)
-            # Build synthetic ISO timestamps anchored to today's midnight JST
-            today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
             hours_iso = [f"{today}T{h:02d}:00" for h in range(_HOURS_PER_DAY)]
-
-        for hour_idx, (iso_str, temp, hum) in enumerate(
-            zip(hours_iso, temperatures, humidities)
-        ):
-            rows.append(
-                {
-                    "name": name,
-                    "name_en": pref["name_en"],
-                    "lat": pref["lat"],
-                    "lon": pref["lon"],
-                    "region": pref["region"],
-                    "hour": hour_idx,
-                    "time": pd.Timestamp(iso_str),
-                    "temperature": round(float(temp), 1),
-                    "humidity": round(float(hum), 1),
-                    "discomfort_index": round(
-                        calculate_discomfort_index(float(temp), float(hum)), 1
-                    ),
-                }
-            )
+        rows.extend(_build_rows(pref, hours_iso, temperatures, humidities))
 
     df = pd.DataFrame(rows)
-    logger.info("Fetched data: %d rows for %d prefectures", len(df), len(prefectures))
+    logger.info("Sequential fetch done: %d rows, %d stations", len(df), len(prefectures))
     return df
 
 
-def get_mock_data(prefectures: list[dict]) -> pd.DataFrame:
-    """Generate realistic mock weather data for all prefectures across 24 hours.
+# ---------------------------------------------------------------------------
+# Parallel fetch (全市町村 mode)
+# ---------------------------------------------------------------------------
 
-    Temperature and humidity vary by region (e.g. 北海道 is cooler, 沖縄 is
-    hotter and more humid) and follow a plausible diurnal cycle.
+def fetch_all_parallel(
+    stations: list[dict],
+    max_workers: int = 15,
+) -> pd.DataFrame:
+    """Fetch weather for all stations concurrently using a thread pool.
+
+    Stations that fail the API call fall back to mock data so the returned
+    DataFrame is always complete.
 
     Args:
-        prefectures: List of prefecture dicts with keys ``name``, ``name_en``,
-            ``lat``, ``lon``, and ``region``.
+        stations:    List of station dicts (name, name_en, lat, lon, region).
+        max_workers: Max concurrent HTTP requests.  Default 15.
 
     Returns:
-        A ``pd.DataFrame`` with one row per (prefecture, hour) and columns:
-        ``name``, ``name_en``, ``lat``, ``lon``, ``region``, ``hour``,
-        ``time``, ``temperature``, ``humidity``, ``discomfort_index``.
+        DataFrame with the same schema as ``fetch_all_prefectures``.
     """
-    # Use a fixed seed for reproducibility during development / testing
-    rng = np.random.default_rng(seed=42)
-    rows: list[dict] = []
+    if len(stations) > _MAX_STATIONS:
+        logger.warning(
+            "Station list truncated from %d to %d", len(stations), _MAX_STATIONS
+        )
+        stations = stations[:_MAX_STATIONS]
 
+    rng   = np.random.default_rng()
     today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
 
-    for pref in prefectures:
-        name: str = pref["name"]
-        temperatures, humidities = _make_mock_hours(pref["region"], rng)
+    # Parallel HTTP requests
+    results: dict[str, tuple[dict, dict | None]] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_station = {
+            executor.submit(fetch_weather_for_location, s["lat"], s["lon"]): s
+            for s in stations
+        }
+        for future in as_completed(future_to_station):
+            s = future_to_station[future]
+            try:
+                weather = future.result()
+            except Exception as exc:
+                logger.error("Fetch error for %s: %s", s["name"], exc)
+                weather = None
+            results[s["name"]] = (s, weather)
 
-        for hour_idx, (temp, hum) in enumerate(zip(temperatures, humidities)):
-            rows.append(
-                {
-                    "name": name,
-                    "name_en": pref["name_en"],
-                    "lat": pref["lat"],
-                    "lon": pref["lon"],
-                    "region": pref["region"],
-                    "hour": hour_idx,
-                    "time": pd.Timestamp(f"{today}T{hour_idx:02d}:00"),
-                    "temperature": round(float(temp), 1),
-                    "humidity": round(float(hum), 1),
-                    "discomfort_index": round(
-                        calculate_discomfort_index(float(temp), float(hum)), 1
-                    ),
-                }
-            )
+    n_ok = sum(1 for _, (_, w) in results.items() if w is not None)
+    logger.info(
+        "Parallel fetch done: %d/%d succeeded (%d workers)",
+        n_ok, len(stations), max_workers,
+    )
+
+    # Build rows
+    rows: list[dict] = []
+    for _name, (station, weather) in results.items():
+        if weather is not None:
+            hours_iso    = weather["hours"][:_HOURS_PER_DAY]
+            temperatures = weather["temperature"][:_HOURS_PER_DAY]
+            humidities   = weather["humidity"][:_HOURS_PER_DAY]
+        else:
+            temperatures, humidities = _make_mock_hours(station["region"], rng)
+            hours_iso = [f"{today}T{h:02d}:00" for h in range(_HOURS_PER_DAY)]
+        rows.extend(_build_rows(station, hours_iso, temperatures, humidities))
 
     df = pd.DataFrame(rows)
-    logger.debug("Generated mock data: %d rows for %d prefectures", len(df), len(prefectures))
+    logger.info("Built DataFrame: %d rows, %d stations", len(df), len(stations))
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Pure mock (no network)
+# ---------------------------------------------------------------------------
+
+def get_mock_data(prefectures: list[dict]) -> pd.DataFrame:
+    """Generate deterministic mock weather data (no network calls)."""
+    rng   = np.random.default_rng(seed=42)
+    today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+    rows: list[dict] = []
+    for pref in prefectures:
+        temperatures, humidities = _make_mock_hours(pref["region"], rng)
+        hours_iso = [f"{today}T{h:02d}:00" for h in range(_HOURS_PER_DAY)]
+        rows.extend(_build_rows(pref, hours_iso, temperatures, humidities))
+    df = pd.DataFrame(rows)
+    logger.debug("Mock data: %d rows, %d stations", len(df), len(prefectures))
     return df

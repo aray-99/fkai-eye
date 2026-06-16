@@ -1,18 +1,23 @@
 """
 Spatial interpolation utilities for Japan Discomfort Index (不快指数) visualization.
 
-Provides IDW (Inverse Distance Weighting) interpolation to create smooth
-surfaces of discomfort index values across Japan, suitable for use with
-Pydeck's HeatmapLayer.
+Provides:
+  - IDW interpolation (original, fast)
+  - CloughTocher2D smooth interpolation (C1 cubic, high quality)
+  - Japan-coastline-clipped grid generation
+  - Delaunay TIN wireframe for LineLayer
+  - Color mapping utilities
 """
+
+import logging
 
 import numpy as np
 import pandas as pd
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Color stop table: (DI threshold, (R, G, B))
-# Interpolated linearly between stops.
 # ---------------------------------------------------------------------------
 _COLOR_STOPS: list[tuple[float, tuple[int, int, int]]] = [
     (55.0, (0,   100, 200)),   # blue        – 不快でない
@@ -20,15 +25,15 @@ _COLOR_STOPS: list[tuple[float, tuple[int, int, int]]] = [
     (65.0, (80,  220,  50)),   # yellow-green – やや不快
     (70.0, (255, 180,   0)),   # orange      – 不快
     (75.0, (255,  60,   0)),   # red-orange  – かなり不快
-    (80.0, (200,   0,  80)),   # dark red/magenta – 非常に不快 / 暑くてたまらない
+    (80.0, (200,   0,  80)),   # dark red/magenta – 非常に不快
 ]
 
-_ALPHA_HEATMAP = 180   # alpha for heatmap grid points
-_ALPHA_SINGLE  = 220   # alpha for get_di_color()
+_ALPHA_HEATMAP = 180
+_ALPHA_SINGLE  = 220
 
 
 # ---------------------------------------------------------------------------
-# 1. Pure IDW implementation
+# 1. IDW interpolation (fast fallback / standalone use)
 # ---------------------------------------------------------------------------
 
 def idw_interpolate(
@@ -39,38 +44,11 @@ def idw_interpolate(
     grid_lons: np.ndarray,
     power: float = 2,
 ) -> np.ndarray:
-    """Interpolate values at grid points using Inverse Distance Weighting (IDW).
+    """Inverse Distance Weighting interpolation (vectorised).
 
-    For each target grid point the interpolated value is:
-
-        z(x) = sum(v_i / d_i^p) / sum(1 / d_i^p)
-
-    where d_i is the Euclidean distance (in degrees) to known point i and p is
-    the IDW power parameter.  When a grid point coincides exactly with a known
-    point the known value is returned directly to avoid division by zero.
-
-    Parameters
-    ----------
-    known_lats:
-        1-D array of latitudes for the source data points.
-    known_lons:
-        1-D array of longitudes for the source data points.
-    known_values:
-        1-D array of values at the source data points.
-    grid_lats:
-        1-D array of latitudes for the target grid points.
-    grid_lons:
-        1-D array of longitudes for the target grid points.
-    power:
-        IDW power parameter controlling how quickly influence decays with
-        distance.  Higher values give more local influence to nearby points.
-        Default is 2.
-
-    Returns
-    -------
-    np.ndarray
-        1-D array of interpolated values with the same length as *grid_lats* /
-        *grid_lons*.
+    Returns interpolated values at ``(grid_lats, grid_lons)`` using the
+    weighted average of all known points.  Points that coincide exactly with
+    a known point return that point's value directly.
     """
     known_lats   = np.asarray(known_lats,   dtype=float)
     known_lons   = np.asarray(known_lons,   dtype=float)
@@ -78,31 +56,22 @@ def idw_interpolate(
     grid_lats    = np.asarray(grid_lats,    dtype=float)
     grid_lons    = np.asarray(grid_lons,    dtype=float)
 
-    n_grid   = len(grid_lats)
-    n_known  = len(known_lats)
+    dlat = grid_lats[:, np.newaxis] - known_lats[np.newaxis, :]
+    dlon = grid_lons[:, np.newaxis] - known_lons[np.newaxis, :]
+    dist = np.sqrt(dlat ** 2 + dlon ** 2)
 
-    # Vectorised distance matrix: shape (n_grid, n_known)
-    dlat = grid_lats[:, np.newaxis] - known_lats[np.newaxis, :]   # (G, K)
-    dlon = grid_lons[:, np.newaxis] - known_lons[np.newaxis, :]   # (G, K)
-    dist = np.sqrt(dlat ** 2 + dlon ** 2)                          # (G, K)
+    n_grid  = len(grid_lats)
+    result  = np.empty(n_grid, dtype=float)
 
-    result = np.empty(n_grid, dtype=float)
-
-    # Identify grid points that coincide exactly with a known point.
-    exact_mask = np.any(dist == 0.0, axis=1)   # (G,)
-
-    # --- Exact coincidences: return the known value directly ---------------
+    exact_mask = np.any(dist == 0.0, axis=1)
     if np.any(exact_mask):
-        exact_indices = np.where(exact_mask)[0]
-        for gi in exact_indices:
-            ki = np.argmin(dist[gi])   # index of the coinciding known point
-            result[gi] = known_values[ki]
+        for gi in np.where(exact_mask)[0]:
+            result[gi] = known_values[np.argmin(dist[gi])]
 
-    # --- All other grid points: weighted average ---------------------------
     non_exact = ~exact_mask
     if np.any(non_exact):
-        d_sub   = dist[non_exact]                  # (M, K)
-        weights = 1.0 / (d_sub ** power)           # (M, K)
+        d_sub   = dist[non_exact]
+        weights = 1.0 / (d_sub ** power)
         result[non_exact] = (
             np.sum(weights * known_values[np.newaxis, :], axis=1)
             / np.sum(weights, axis=1)
@@ -112,7 +81,7 @@ def idw_interpolate(
 
 
 # ---------------------------------------------------------------------------
-# 2. Japan grid factory
+# 2. Grid factories
 # ---------------------------------------------------------------------------
 
 def create_japan_grid(
@@ -122,34 +91,70 @@ def create_japan_grid(
     lon_max: float = 146.0,
     resolution: float = 0.5,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Create a regular latitude/longitude grid covering Japan.
-
-    Parameters
-    ----------
-    lat_min:
-        Southern boundary in decimal degrees.  Default 24.0 (Okinawa).
-    lat_max:
-        Northern boundary in decimal degrees.  Default 46.0 (Hokkaido).
-    lon_min:
-        Western boundary in decimal degrees.  Default 122.0.
-    lon_max:
-        Eastern boundary in decimal degrees.  Default 146.0.
-    resolution:
-        Grid spacing in degrees.  Default 0.5.
-
-    Returns
-    -------
-    tuple[np.ndarray, np.ndarray]
-        ``(grid_lats, grid_lons)`` – both 1-D arrays produced by
-        :func:`numpy.meshgrid` (flattened).  Together they enumerate every
-        grid point in row-major order.
-    """
+    """Create a regular lat/lon grid covering Japan (full rectangular bbox)."""
     lats = np.arange(lat_min, lat_max + resolution * 0.5, resolution)
     lons = np.arange(lon_min, lon_max + resolution * 0.5, resolution)
-
-    lon_grid, lat_grid = np.meshgrid(lons, lats)   # (rows=lat, cols=lon)
-
+    lon_grid, lat_grid = np.meshgrid(lons, lats)
     return lat_grid.ravel(), lon_grid.ravel()
+
+
+def create_japan_grid_clipped(
+    lat_min: float = 24.0,
+    lat_max: float = 46.0,
+    lon_min: float = 122.0,
+    lon_max: float = 146.0,
+    resolution: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Create a grid clipped to Japan's actual coastline polygon.
+
+    Downloads Japan's boundary from Natural Earth on the first call
+    (cached to ``.cache/japan_geom.gpkg``).  Falls back to the full
+    rectangular grid when the geometry is unavailable.
+
+    Uses ``shapely.contains_xy`` for fast vectorised point-in-polygon.
+    """
+    grid_lats, grid_lons = create_japan_grid(
+        lat_min=lat_min, lat_max=lat_max,
+        lon_min=lon_min, lon_max=lon_max,
+        resolution=resolution,
+    )
+
+    japan_geom = _get_japan_geom()
+    if japan_geom is None:
+        logger.warning("Japan geometry unavailable – using full rectangular grid")
+        return grid_lats, grid_lons
+
+    try:
+        from shapely import contains_xy
+        # Small buffer (~5 km) to include coastal/island points
+        buffered = japan_geom.buffer(0.05)
+        mask = contains_xy(buffered, grid_lons, grid_lats)
+    except Exception as exc:
+        logger.warning("shapely.contains_xy failed (%s) – falling back to geopandas", exc)
+        try:
+            import geopandas as gpd
+            pts  = gpd.GeoSeries.from_xy(grid_lons, grid_lats, crs="EPSG:4326")
+            mask = pts.within(japan_geom.buffer(0.05)).values
+        except Exception as exc2:
+            logger.error("Grid clipping failed: %s", exc2)
+            return grid_lats, grid_lons
+
+    clipped_lats = grid_lats[mask]
+    clipped_lons = grid_lons[mask]
+    logger.info(
+        "Grid clipped to Japan: %d / %d points retained (resolution=%.2f°)",
+        len(clipped_lats), len(grid_lats), resolution,
+    )
+    return clipped_lats, clipped_lons
+
+
+def _get_japan_geom():
+    """Lazy import wrapper so interpolation.py has no hard dep on municipalities."""
+    try:
+        from municipalities import get_japan_geometry
+        return get_japan_geometry()
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -161,164 +166,189 @@ def di_to_normalized(
     di_min: float = 55.0,
     di_max: float = 85.0,
 ) -> float:
-    """Normalize a discomfort index value to the [0, 1] range.
-
-    Values below *di_min* clamp to 0.0; values above *di_max* clamp to 1.0.
-
-    Parameters
-    ----------
-    di_value:
-        Raw discomfort index value.
-    di_min:
-        Lower bound of the expected DI range.  Default 55.0.
-    di_max:
-        Upper bound of the expected DI range.  Default 85.0.
-
-    Returns
-    -------
-    float
-        Normalized value in ``[0.0, 1.0]``.
-    """
+    """Normalise a DI value to [0, 1]."""
     if di_max == di_min:
         return 0.0
     return float(np.clip((di_value - di_min) / (di_max - di_min), 0.0, 1.0))
 
 
 def _di_to_rgb(di_value: float) -> tuple[int, int, int]:
-    """Return the (R, G, B) colour for *di_value* by linearly interpolating
-    between the entries in ``_COLOR_STOPS``.
-
-    Values below the first stop return the first stop's colour; values above
-    the last stop return the last stop's colour.
-    """
+    """Piecewise-linear colour interpolation between ``_COLOR_STOPS``."""
     stops = _COLOR_STOPS
-
     if di_value <= stops[0][0]:
         return stops[0][1]
     if di_value >= stops[-1][0]:
         return stops[-1][1]
-
-    # Find the surrounding pair of stops.
     for i in range(len(stops) - 1):
         lo_di, lo_rgb = stops[i]
         hi_di, hi_rgb = stops[i + 1]
         if lo_di <= di_value <= hi_di:
-            t = (di_value - lo_di) / (hi_di - lo_di)   # 0..1 within segment
-            r = int(round(lo_rgb[0] + t * (hi_rgb[0] - lo_rgb[0])))
-            g = int(round(lo_rgb[1] + t * (hi_rgb[1] - lo_rgb[1])))
-            b = int(round(lo_rgb[2] + t * (hi_rgb[2] - lo_rgb[2])))
-            return (
-                int(np.clip(r, 0, 255)),
-                int(np.clip(g, 0, 255)),
-                int(np.clip(b, 0, 255)),
-            )
-
-    # Fallback (should not be reached).
+            t = (di_value - lo_di) / (hi_di - lo_di)
+            r = int(np.clip(round(lo_rgb[0] + t * (hi_rgb[0] - lo_rgb[0])), 0, 255))
+            g = int(np.clip(round(lo_rgb[1] + t * (hi_rgb[1] - lo_rgb[1])), 0, 255))
+            b = int(np.clip(round(lo_rgb[2] + t * (hi_rgb[2] - lo_rgb[2])), 0, 255))
+            return (r, g, b)
     return stops[-1][1]
 
 
 def get_di_color(di_value: float) -> tuple[int, int, int, int]:
-    """Return an RGBA colour tuple for a single discomfort index value.
-
-    The colour scale maps the perceived thermal comfort level (不快指数) to
-    a cool-to-hot palette:
-
-    +---------+--------------------+----------------------------+
-    | DI      | Japanese label     | Colour                     |
-    +=========+====================+============================+
-    | ≤ 55    | 不快でない         | Blue                       |
-    +---------+--------------------+----------------------------+
-    | 60–65   | やや不快           | Cyan → Yellow-green        |
-    +---------+--------------------+----------------------------+
-    | 65–70   | 不快               | Yellow-green → Orange      |
-    +---------+--------------------+----------------------------+
-    | 70–75   | かなり不快         | Orange → Red               |
-    +---------+--------------------+----------------------------+
-    | ≥ 80    | 暑くてたまらない   | Dark red / Magenta         |
-    +---------+--------------------+----------------------------+
-
-    Parameters
-    ----------
-    di_value:
-        Discomfort index value.
-
-    Returns
-    -------
-    tuple[int, int, int, int]
-        ``(r, g, b, a)`` where each component is in ``[0, 255]`` and
-        ``a`` is fixed at 220.
-    """
+    """Return ``(r, g, b, a)`` for a single DI value (a=220)."""
     r, g, b = _di_to_rgb(di_value)
     return (r, g, b, _ALPHA_SINGLE)
 
 
+def _add_colors(df: pd.DataFrame) -> pd.DataFrame:
+    """Add color_r/g/b/a columns derived from discomfort_index."""
+    n = len(df)
+    cr = np.empty(n, dtype=np.uint8)
+    cg = np.empty(n, dtype=np.uint8)
+    cb = np.empty(n, dtype=np.uint8)
+    for i, di in enumerate(df["discomfort_index"].to_numpy(dtype=float)):
+        r, g, b = _di_to_rgb(float(di))
+        cr[i] = r; cg[i] = g; cb[i] = b
+    df = df.copy()
+    df["color_r"] = cr
+    df["color_g"] = cg
+    df["color_b"] = cb
+    df["color_a"] = np.full(n, _ALPHA_HEATMAP, dtype=np.uint8)
+    return df
+
+
 # ---------------------------------------------------------------------------
-# 4. High-level interpolation entry-point
+# 4. IDW interpolation pipeline (original, rectangular grid)
 # ---------------------------------------------------------------------------
 
 def interpolate_discomfort_for_hour(
     df_hour: pd.DataFrame,
     resolution: float = 0.5,
 ) -> pd.DataFrame:
-    """Interpolate discomfort index values to a regular Japan grid for one hour.
-
-    Reads observed station values from *df_hour*, creates a regular grid with
-    :func:`create_japan_grid`, runs :func:`idw_interpolate`, and attaches
-    per-point RGBA colour values ready for use with Pydeck's HeatmapLayer.
-
-    Parameters
-    ----------
-    df_hour:
-        DataFrame filtered to a single hour.  Must contain the columns
-        ``lat``, ``lon``, and ``discomfort_index``.
-    resolution:
-        Grid spacing in degrees passed to :func:`create_japan_grid`.
-        Default 0.5.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with columns:
-
-        * ``lat``               – grid point latitude
-        * ``lon``               – grid point longitude
-        * ``discomfort_index``  – IDW-interpolated DI value
-        * ``color_r``           – red channel (0-255)
-        * ``color_g``           – green channel (0-255)
-        * ``color_b``           – blue channel (0-255)
-        * ``color_a``           – alpha channel (fixed at 180)
-    """
+    """IDW interpolation onto a full rectangular Japan grid (original method)."""
     known_lats   = df_hour["lat"].to_numpy(dtype=float)
     known_lons   = df_hour["lon"].to_numpy(dtype=float)
     known_values = df_hour["discomfort_index"].to_numpy(dtype=float)
 
     grid_lats, grid_lons = create_japan_grid(resolution=resolution)
-
     interpolated = idw_interpolate(
-        known_lats, known_lons, known_values,
-        grid_lats, grid_lons,
+        known_lats, known_lons, known_values, grid_lats, grid_lons,
     )
 
-    # Vectorised colour mapping.
-    n = len(interpolated)
-    color_r = np.empty(n, dtype=np.uint8)
-    color_g = np.empty(n, dtype=np.uint8)
-    color_b = np.empty(n, dtype=np.uint8)
+    result = pd.DataFrame({
+        "lat":              grid_lats,
+        "lon":              grid_lons,
+        "discomfort_index": np.round(interpolated, 1),
+    })
+    return _add_colors(result)
 
-    for i, di in enumerate(interpolated):
-        r, g, b = _di_to_rgb(float(di))
-        color_r[i] = r
-        color_g[i] = g
-        color_b[i] = b
 
-    return pd.DataFrame(
+# ---------------------------------------------------------------------------
+# 5. CloughTocher2D smooth interpolation (C1 cubic) – coastline-clipped grid
+# ---------------------------------------------------------------------------
+
+def interpolate_discomfort_smooth(
+    df_hour: pd.DataFrame,
+    resolution: float = 0.3,
+) -> pd.DataFrame:
+    """High-quality C1-cubic interpolation using CloughTocher2DInterpolator.
+
+    The interpolation is performed on a grid clipped to Japan's coastline
+    polygon, so ocean cells are removed.
+
+    Points outside the convex hull of the input data (where CloughTocher
+    returns NaN) are filled with IDW as a fallback, ensuring full coverage
+    over the clipped grid.
+
+    Args:
+        df_hour: DataFrame for a single hour.  Must contain ``lat``, ``lon``,
+            and ``discomfort_index`` columns.
+        resolution: Grid spacing in degrees.  Default 0.3 (~33 km).
+
+    Returns:
+        DataFrame with lat, lon, discomfort_index, color_r/g/b/a columns.
+    """
+    from scipy.interpolate import CloughTocher2DInterpolator
+
+    lons = df_hour["lon"].to_numpy(dtype=float)
+    lats = df_hour["lat"].to_numpy(dtype=float)
+    dis  = df_hour["discomfort_index"].to_numpy(dtype=float)
+
+    grid_lats, grid_lons = create_japan_grid_clipped(resolution=resolution)
+
+    ct = CloughTocher2DInterpolator(
+        np.column_stack([lons, lats]),
+        dis,
+        fill_value=np.nan,
+    )
+    interpolated = ct(np.column_stack([grid_lons, grid_lats]))
+
+    # Fill NaN (outside convex hull) with IDW
+    nan_mask = np.isnan(interpolated)
+    if nan_mask.any():
+        fallback = idw_interpolate(
+            lats, lons, dis,
+            grid_lats[nan_mask], grid_lons[nan_mask],
+        )
+        interpolated[nan_mask] = fallback
+
+    result = pd.DataFrame({
+        "lat":              grid_lats,
+        "lon":              grid_lons,
+        "discomfort_index": np.round(interpolated, 1),
+    })
+    return _add_colors(result)
+
+
+# ---------------------------------------------------------------------------
+# 6. Delaunay TIN wireframe for pydeck LineLayer
+# ---------------------------------------------------------------------------
+
+def create_tin_wireframe(
+    df_hour: pd.DataFrame,
+    elevation_scale: float = 9000.0,
+    base_di: float = 55.0,
+) -> list[dict]:
+    """Build Delaunay TIN edge list for pydeck ``LineLayer`` (3-D lines).
+
+    Each edge is a dict with::
+
         {
-            "lat":              grid_lats,
-            "lon":              grid_lons,
-            "discomfort_index": interpolated,
-            "color_r":          color_r,
-            "color_g":          color_g,
-            "color_b":          color_b,
-            "color_a":          np.full(n, _ALPHA_HEATMAP, dtype=np.uint8),
+          "source": [lon_a, lat_a, elevation_a],
+          "target": [lon_b, lat_b, elevation_b],
         }
-    )
+
+    The elevation encodes the discomfort index so the wireframe follows the
+    same height profile as the surface layer.
+
+    Args:
+        df_hour: DataFrame for a single hour.
+        elevation_scale: Metres per DI unit above ``base_di``.
+        base_di: DI value at elevation 0.
+
+    Returns:
+        List of edge dicts ready to be passed as ``data`` to a pydeck Layer.
+    """
+    from scipy.spatial import Delaunay
+
+    lons = df_hour["lon"].to_numpy(dtype=float)
+    lats = df_hour["lat"].to_numpy(dtype=float)
+    dis  = df_hour["discomfort_index"].to_numpy(dtype=float)
+
+    pts = np.column_stack([lons, lats])
+    tri = Delaunay(pts)
+
+    seen: set[tuple[int, int]] = set()
+    edges: list[dict] = []
+    for simplex in tri.simplices:
+        for i in range(3):
+            a, b = simplex[i], simplex[(i + 1) % 3]
+            key = (min(a, b), max(a, b))
+            if key not in seen:
+                seen.add(key)
+                ea = float(max(0.0, (dis[a] - base_di) * elevation_scale))
+                eb = float(max(0.0, (dis[b] - base_di) * elevation_scale))
+                edges.append({
+                    "source": [float(lons[a]), float(lats[a]), ea],
+                    "target": [float(lons[b]), float(lats[b]), eb],
+                })
+
+    logger.debug("TIN wireframe: %d edges from %d points", len(edges), len(lons))
+    return edges

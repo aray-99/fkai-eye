@@ -1,6 +1,5 @@
 """
 🌡️ 不快指数マップ – Japan Discomfort Index 3D Visualizer
-Main Streamlit application entry-point.
 """
 
 # ---------------------------------------------------------------------------
@@ -16,63 +15,84 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Standard library & third-party imports
+# Imports
 # ---------------------------------------------------------------------------
+import logging
 import os
 import sys
 import time
 
 import pydeck as pdk
 
-# ---------------------------------------------------------------------------
-# Path setup — insert src/ so we can import local modules
-# ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
-# ---------------------------------------------------------------------------
-# Project module imports
-# ---------------------------------------------------------------------------
-from prefectures import PREFECTURES, REGION_VIEWS  # noqa: E402
-from fetcher import fetch_all_prefectures, get_mock_data  # noqa: E402
-from interpolation import (  # noqa: E402
-    interpolate_discomfort_for_hour,
-    get_di_color,
-    di_to_normalized,  # available for future use
+from prefectures import PREFECTURES, REGION_VIEWS
+from fetcher import (
+    fetch_all_prefectures,
+    fetch_all_parallel,
+    get_mock_data,
 )
+from interpolation import (
+    interpolate_discomfort_smooth,
+    create_tin_wireframe,
+    get_di_color,
+    di_to_normalized,  # noqa: F401 – available for downstream use
+)
+from municipalities import get_all_municipalities
 
+logging.basicConfig(level=logging.INFO)
 
 # ---------------------------------------------------------------------------
-# Session state initialization
+# Session state initialisation
 # ---------------------------------------------------------------------------
-if "view_state" not in st.session_state:
-    st.session_state.view_state = dict(REGION_VIEWS["全国"])
-if "playing" not in st.session_state:
-    st.session_state.playing = False
-if "current_hour" not in st.session_state:
-    st.session_state.current_hour = 0
-if "anim_speed" not in st.session_state:
-    st.session_state.anim_speed = "普通 (0.8s)"
+_DEFAULTS: dict = {
+    "cam_lat":     37.0,
+    "cam_lon":     137.0,
+    "cam_zoom":    4.5,
+    "playing":     False,
+    "current_hour": 0,
+    "anim_speed":  "普通 (0.8s)",
+}
+for _k, _v in _DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
 
 
 # ---------------------------------------------------------------------------
 # Cached data loaders
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=1800)
-def load_live_data() -> tuple:
-    """Fetch live weather data from Open-Meteo; fall back to mock on any error."""
-    try:
-        df = fetch_all_prefectures(PREFECTURES)
-        return df, False
-    except Exception:
-        df = get_mock_data(PREFECTURES)
-        return df, True
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_live_data(use_municipalities: bool) -> tuple:
+    """Live data from Open-Meteo (cached 30 min).  Falls back to mock on error."""
+    if use_municipalities:
+        stations = get_all_municipalities()
+        if not stations:
+            stations = PREFECTURES
+        try:
+            df = fetch_all_parallel(stations, max_workers=15)
+            return df, False
+        except Exception as exc:
+            logging.error("Parallel fetch failed: %s", exc)
+            return get_mock_data(stations), True
+    else:
+        try:
+            df = fetch_all_prefectures(PREFECTURES)
+            return df, False
+        except Exception as exc:
+            logging.error("Sequential fetch failed: %s", exc)
+            return get_mock_data(PREFECTURES), True
 
 
-@st.cache_data
-def load_mock_data() -> tuple:
-    """Return deterministic mock weather data (no network calls)."""
-    df = get_mock_data(PREFECTURES)
-    return df, True
+@st.cache_data(show_spinner=False)
+def load_mock_data(use_municipalities: bool) -> tuple:
+    """Deterministic mock data (no network)."""
+    if use_municipalities:
+        stations = get_all_municipalities()
+        if not stations:
+            stations = PREFECTURES
+    else:
+        stations = PREFECTURES
+    return get_mock_data(stations), True
 
 
 # ---------------------------------------------------------------------------
@@ -86,86 +106,99 @@ with st.sidebar:
     # ── Data source ──────────────────────────────────────────────────────────
     st.markdown("### 📡 データソース")
     data_source = st.radio(
-        "データソース選択",
-        options=["🌐 ライブAPI (Open-Meteo)", "🔧 モックデータ"],
+        "source", ["🌐 ライブAPI (Open-Meteo)", "🔧 モックデータ"],
         label_visibility="collapsed",
     )
+
+    # ── Data resolution ───────────────────────────────────────────────────────
+    st.markdown("### 📊 観測点数")
+    data_res = st.radio(
+        "resolution",
+        ["標準 (47都道府県庁)", "高精度 (全市町村)"],
+        label_visibility="collapsed",
+    )
+    if data_res.startswith("高精度"):
+        st.caption("💡 初回は Natural Earth からデータをダウンロードし、"
+                   "並列APIフェッチを行います（初回のみ 1〜2 分）。")
+
     st.markdown("---")
 
-    # ── Display mode ─────────────────────────────────────────────────────────
+    # ── Display mode ──────────────────────────────────────────────────────────
     st.markdown("### 🗺️ 表示モード")
     display_mode = st.radio(
-        "表示モード選択",
-        options=["A: 離散表示（柱グラフ）", "B: 連続サーフェス（IDW補間）"],
+        "mode",
+        ["A: 離散表示（3D 柱）", "B: TIN メッシュ（補間サーフェス）"],
         label_visibility="collapsed",
     )
     if display_mode.startswith("A"):
-        st.caption("各都市の不快指数を3D柱で表示します。")
+        st.caption("各観測点の不快指数を 3D 柱の高さと色で表示します。")
     else:
-        st.caption("IDW補間で日本全土を滑らかなサーフェスで可視化します。")
+        st.caption("Delaunay 三角分割ワイヤーフレーム ＋ CloughTocher C1 三次補間による"
+                   "滑らかな 3D サーフェスを日本列島の形に沿って描画します。")
+
     st.markdown("---")
 
-    # ── Timeline ─────────────────────────────────────────────────────────────
+    # ── Timeline ──────────────────────────────────────────────────────────────
     st.markdown("### ⏱️ タイムライン")
 
     if not st.session_state.playing:
-        selected_hour = st.slider(
-            "時刻",
-            min_value=0,
-            max_value=23,
-            value=st.session_state.current_hour,
-            format="%d時",
-            key="hour_slider",
+        st.slider(
+            "時刻", min_value=0, max_value=23,
+            format="%d時", key="current_hour",
         )
-        st.session_state.current_hour = selected_hour
     else:
         st.info(f"▶️ 再生中: {st.session_state.current_hour:02d}:00")
 
-    btn_col1, btn_col2 = st.columns(2)
-    with btn_col1:
-        if st.button("▶️ 再生", disabled=st.session_state.playing, use_container_width=True):
+    btn1, btn2 = st.columns(2)
+    with btn1:
+        if st.button("▶️ 再生", disabled=st.session_state.playing,
+                     use_container_width=True):
             st.session_state.playing = True
             st.rerun()
-    with btn_col2:
+    with btn2:
         if st.button("⏹️ 停止", use_container_width=True):
             st.session_state.playing = False
 
     if not st.session_state.playing:
         st.selectbox(
             "アニメーション速度",
-            options=["遅い (1.5s)", "普通 (0.8s)", "速い (0.3s)"],
-            index=["遅い (1.5s)", "普通 (0.8s)", "速い (0.3s)"].index(
-                st.session_state.get("anim_speed", "普通 (0.8s)")
-            ),
+            ["遅い (1.5s)", "普通 (0.8s)", "速い (0.3s)"],
             key="anim_speed",
         )
 
     st.markdown("---")
 
-    # ── Quick-snap region buttons ─────────────────────────────────────────────
+    # ── Quick snap ────────────────────────────────────────────────────────────
     st.markdown("### 📍 クイックスナップ")
-    snap_regions = ["全国", "関東", "九州", "沖縄", "北海道", "近畿"]
-    snap_cols = st.columns(3)
-    for idx, region in enumerate(snap_regions):
-        col = snap_cols[idx % 3]
-        with col:
-            if st.button(region, use_container_width=True, key=f"snap_{region}"):
-                st.session_state.view_state = dict(REGION_VIEWS[region])
+    _snap_regions = ["全国", "関東", "九州", "沖縄", "北海道", "近畿"]
+    _snap_cols = st.columns(3)
+    for _i, _region in enumerate(_snap_regions):
+        with _snap_cols[_i % 3]:
+            if st.button(_region, key=f"snap_{_region}", use_container_width=True):
+                _vs = REGION_VIEWS[_region]
+                st.session_state.cam_lat  = _vs["latitude"]
+                st.session_state.cam_lon  = _vs["longitude"]
+                st.session_state.cam_zoom = _vs["zoom"]
+
+    # ── Mouse / keyboard hint ─────────────────────────────────────────────────
+    st.caption(
+        "🖱️ **右ドラッグ** または **Ctrl＋ドラッグ** で 3D 視点変更 ／ "
+        "**スクロール** でズーム"
+    )
 
     st.markdown("---")
 
-    # ── DI color legend ───────────────────────────────────────────────────────
+    # ── Color legend ──────────────────────────────────────────────────────────
     st.markdown("### 🎨 DI カラー凡例")
-    legend_items = [
-        ("🔵", "≤ 60", "不快でない"),
+    for _emoji, _rng, _lbl in [
+        ("🔵", "≤ 60",  "不快でない"),
         ("🟢", "60–65", "やや不快"),
         ("🟡", "65–70", "不快"),
         ("🟠", "70–75", "かなり不快"),
         ("🔴", "75–80", "非常に不快"),
-        ("🟣", "80+",   "暑くてたまらない"),
-    ]
-    for emoji, di_range, label in legend_items:
-        st.markdown(f"{emoji} **{di_range}** &nbsp; {label}")
+        ("🟣", "80＋",  "暑くてたまらない"),
+    ]:
+        st.markdown(f"{_emoji} **{_rng}** &nbsp; {_lbl}")
 
     st.markdown("---")
     st.markdown("**DI 計算式**")
@@ -174,162 +207,177 @@ with st.sidebar:
 
 
 # ---------------------------------------------------------------------------
-# Main content — header
+# Main area – header
 # ---------------------------------------------------------------------------
-st.title("🌡️ 日本の不快指数 リアルタイム3Dマップ")
-st.caption("Open-Meteo API | Powered by Pydeck + Streamlit")
+st.title("🌡️ 日本の不快指数 リアルタイム 3D マップ")
+st.caption("Open-Meteo API | CloughTocher 補間 | Natural Earth 海岸線クリップ | Pydeck + Streamlit")
 
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
-if data_source.startswith("🌐"):
-    df, is_mock = load_live_data()
-else:
-    df, is_mock = load_mock_data()
+use_muni = data_res.startswith("高精度")
 
-# Data source status banner
+with st.spinner("データ取得中…"):
+    if data_source.startswith("🌐"):
+        df, is_mock = load_live_data(use_muni)
+    else:
+        df, is_mock = load_mock_data(use_muni)
+
+n_stations = len(df) // 24  # 24 hours per station
+
 if is_mock:
-    st.warning("⚠️ モックデータを表示中です。ネットワークエラーが発生したか、モックモードが選択されています。")
+    st.warning("⚠️ モックデータを表示中（ネットワーク未接続またはモックモード選択）")
 else:
-    st.success("✅ Open-Meteo API からライブデータを取得しました。")
+    st.success(f"✅ ライブデータ取得完了 — **{n_stations} 地点** / 24 時間")
 
 # ---------------------------------------------------------------------------
-# Filter for selected hour
+# Filter to selected hour
 # ---------------------------------------------------------------------------
 df_hour = df[df["hour"] == st.session_state.current_hour].copy()
 
-# Current time label
-time_label = "N/A"
-if not df_hour.empty and "time" in df_hour.columns:
-    try:
-        ts = df_hour["time"].iloc[0]
-        time_label = f"{st.session_state.current_hour:02d}:00 JST"
-    except Exception:
-        time_label = f"{st.session_state.current_hour:02d}:00"
+st.markdown(f"**表示時刻: {st.session_state.current_hour:02d}:00 JST**")
 
 # ---------------------------------------------------------------------------
 # Summary metrics
 # ---------------------------------------------------------------------------
-st.markdown(f"**🕐 表示時刻:** {time_label}")
+_max_di  = df_hour["discomfort_index"].max()
+_min_di  = df_hour["discomfort_index"].min()
+_avg_di  = df_hour["discomfort_index"].mean()
+_hot_row = df_hour.loc[df_hour["discomfort_index"].idxmax()]
 
-if not df_hour.empty:
-    max_di = df_hour["discomfort_index"].max()
-    min_di = df_hour["discomfort_index"].min()
-    avg_di = df_hour["discomfort_index"].mean()
-    hottest_row = df_hour.loc[df_hour["discomfort_index"].idxmax()]
-    hottest_name = hottest_row["name"]
-    hottest_di = hottest_row["discomfort_index"]
+_m1, _m2, _m3, _m4 = st.columns(4)
+_m1.metric("🔺 最高 DI",  f"{_max_di:.1f}")
+_m2.metric("🔻 最低 DI",  f"{_min_di:.1f}")
+_m3.metric("📊 平均 DI",  f"{_avg_di:.1f}")
+_m4.metric("🏆 最も暑い", _hot_row["name"], f"DI {_hot_row['discomfort_index']:.1f}")
 
-    metric_cols = st.columns(4)
-    with metric_cols[0]:
-        st.metric(label="🔺 最高 DI", value=f"{max_di:.1f}")
-    with metric_cols[1]:
-        st.metric(label="🔻 最低 DI", value=f"{min_di:.1f}")
-    with metric_cols[2]:
-        st.metric(label="📊 平均 DI", value=f"{avg_di:.1f}")
-    with metric_cols[3]:
-        st.metric(
-            label="🏆 最も暑い",
-            value=hottest_name,
-            delta=f"DI {hottest_di:.1f}",
-        )
+# ---------------------------------------------------------------------------
+# ViewState (built from snap-button session state; pitch fixed at 45°)
+# ---------------------------------------------------------------------------
+view_state = pdk.ViewState(
+    latitude  = st.session_state.cam_lat,
+    longitude = st.session_state.cam_lon,
+    zoom      = st.session_state.cam_zoom,
+    pitch     = 45,
+    bearing   = 0,
+)
 
 # ---------------------------------------------------------------------------
 # Build pydeck layers
 # ---------------------------------------------------------------------------
-view_state = pdk.ViewState(**st.session_state.view_state)
+# Scale column radius by station density
+_col_radius = (
+    45_000 if n_stations <= 50 else
+    20_000 if n_stations <= 200 else
+    10_000
+)
 
 if display_mode.startswith("A"):
-    # ── Mode A: Discrete column chart ────────────────────────────────────────
-    df_hour["elevation"] = ((df_hour["discomfort_index"] - 55) * 9000).clip(lower=0)
-    df_hour["color"] = df_hour["discomfort_index"].apply(lambda x: list(get_di_color(x)))
-    df_hour["tooltip_text"] = (
-        df_hour["name"] + " / DI: " + df_hour["discomfort_index"].astype(str)
+    # ── Mode A: discrete 3-D columns ─────────────────────────────────────────
+    df_hour["elevation"] = ((df_hour["discomfort_index"] - 55) * 9_000).clip(lower=0)
+    df_hour["color"]     = df_hour["discomfort_index"].apply(
+        lambda x: list(get_di_color(x))
     )
 
-    layer = pdk.Layer(
-        "ColumnLayer",
-        data=df_hour,
-        get_position=["lon", "lat"],
-        get_elevation="elevation",
-        elevation_scale=1,
-        radius=45000,
-        get_fill_color="color",
-        pickable=True,
-        auto_highlight=True,
-        extruded=True,
-        coverage=0.9,
-    )
-
+    layers = [
+        pdk.Layer(
+            "ColumnLayer",
+            data=df_hour,
+            get_position=["lon", "lat"],
+            get_elevation="elevation",
+            elevation_scale=1,
+            radius=_col_radius,
+            get_fill_color="color",
+            pickable=True,
+            auto_highlight=True,
+            extruded=True,
+            coverage=0.9,
+        )
+    ]
     tooltip = {
         "html": (
             "<b>{name}</b><br/>"
             "不快指数: <b>{discomfort_index}</b><br/>"
-            "気温: {temperature}°C<br/>"
-            "湿度: {humidity}%"
+            "気温: {temperature}°C　湿度: {humidity}%"
         ),
         "style": {
-            "backgroundColor": "rgba(0,0,0,0.75)",
+            "backgroundColor": "rgba(0,0,0,0.78)",
             "color": "white",
             "fontSize": "13px",
             "borderRadius": "6px",
-            "padding": "8px",
+            "padding": "8px 10px",
         },
     }
 
-    layers = [layer]
-
 else:
-    # ── Mode B: Continuous interpolated surface ───────────────────────────────
-    with st.spinner("補間中... (IDW interpolation)"):
-        df_grid = interpolate_discomfort_for_hour(df_hour, resolution=0.5)
-        df_grid["elevation"] = ((df_grid["discomfort_index"] - 55) * 6000).clip(lower=0)
+    # ── Mode B: TIN wireframe + CloughTocher smooth surface ───────────────────
+    with st.spinner("TIN メッシュ生成中（CloughTocher2D 補間）…"):
+        df_grid  = interpolate_discomfort_smooth(df_hour, resolution=0.3)
+        tin_edges = create_tin_wireframe(df_hour, elevation_scale=9_000)
 
+    df_grid["elevation"] = ((df_grid["discomfort_index"] - 55) * 9_000).clip(lower=0)
+
+    # Smooth interpolated surface (hexagonal columns tiling the Japan coastline)
     surface_layer = pdk.Layer(
         "ColumnLayer",
         data=df_grid,
         get_position=["lon", "lat"],
         get_elevation="elevation",
         elevation_scale=1,
-        radius=30000,
+        radius=20_000,          # ~0.3° at 35°N; slight overlap for full coverage
         get_fill_color=["color_r", "color_g", "color_b", "color_a"],
         extruded=True,
-        disk_resolution=6,  # hexagonal tiles for tight packing
+        disk_resolution=6,      # hexagonal cross-section → tighter packing
         pickable=False,
     )
 
-    # Prefecture markers on top for identification
-    df_markers = df_hour[["name", "lat", "lon", "discomfort_index"]].copy()
+    # Delaunay TIN wireframe drawn as 3-D lifted lines
+    wireframe_layer = pdk.Layer(
+        "LineLayer",
+        data=tin_edges,
+        get_source_position="source",   # [lon, lat, elevation]
+        get_target_position="target",
+        get_color=[255, 255, 255, 90],
+        get_width=1_500,                # metres
+        width_min_pixels=1,
+        pickable=False,
+    )
 
+    # Station markers for hover tooltip
     marker_layer = pdk.Layer(
         "ScatterplotLayer",
-        data=df_markers,
+        data=df_hour[
+            ["name", "lat", "lon", "discomfort_index", "temperature", "humidity"]
+        ].copy(),
         get_position=["lon", "lat"],
-        radius_min_pixels=4,
-        radius_max_pixels=12,
-        get_fill_color=[255, 255, 255, 200],
+        radius_min_pixels=3,
+        radius_max_pixels=9,
+        get_fill_color=[255, 255, 255, 220],
+        stroked=True,
+        get_line_color=[30, 30, 30, 255],
+        get_line_width=200,
         pickable=True,
         auto_highlight=True,
     )
 
+    layers  = [surface_layer, wireframe_layer, marker_layer]
     tooltip = {
         "html": (
             "<b>{name}</b><br/>"
-            "不快指数: <b>{discomfort_index}</b>"
+            "不快指数: <b>{discomfort_index}</b><br/>"
+            "気温: {temperature}°C　湿度: {humidity}%"
         ),
         "style": {
-            "backgroundColor": "rgba(0,0,0,0.75)",
+            "backgroundColor": "rgba(0,0,0,0.78)",
             "color": "white",
             "fontSize": "13px",
             "borderRadius": "6px",
-            "padding": "8px",
+            "padding": "8px 10px",
         },
     }
 
-    layers = [surface_layer, marker_layer]
-
 # ---------------------------------------------------------------------------
-# Render pydeck map
+# Render map
 # ---------------------------------------------------------------------------
 deck = pdk.Deck(
     layers=layers,
@@ -337,8 +385,7 @@ deck = pdk.Deck(
     tooltip=tooltip,
     map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
 )
-
-st.pydeck_chart(deck, use_container_width=True, height=600)
+st.pydeck_chart(deck, use_container_width=True, height=620)
 
 # ---------------------------------------------------------------------------
 # Footer
@@ -346,24 +393,27 @@ st.pydeck_chart(deck, use_container_width=True, height=600)
 st.markdown("---")
 st.markdown(
     "<small>"
-    "📡 データソース: <a href='https://open-meteo.com/' target='_blank'>Open-Meteo</a> "
-    "（気温・湿度の予報データ）　|　"
-    "🎨 カラースケール: 青（涼しい）→ 緑 → 黄 → 橙 → 赤 → 紫（酷暑）　|　"
+    "📡 気象データ: <a href='https://open-meteo.com/' target='_blank'>Open-Meteo</a> "
+    "（APIキー不要）&nbsp;｜&nbsp;"
+    "🗾 海岸線: <a href='https://www.naturalearthdata.com/' target='_blank'>"
+    "Natural Earth</a> 50m&nbsp;｜&nbsp;"
+    "🎨 青→緑→黄→橙→赤→紫 (DI 55–80)&nbsp;｜&nbsp;"
     "📐 DI = 0.81T + 0.01U(0.99T − 14.3) + 46.3"
     "</small>",
     unsafe_allow_html=True,
 )
 
 # ---------------------------------------------------------------------------
-# Animation logic — runs AFTER rendering so the current frame is displayed
-# first before advancing to the next hour.
+# Animation logic (runs after current frame is displayed)
 # ---------------------------------------------------------------------------
 if st.session_state.playing:
-    speed_map = {"遅い (1.5s)": 1.5, "普通 (0.8s)": 0.8, "速い (0.3s)": 0.3}
-    delay = speed_map.get(st.session_state.get("anim_speed", "普通 (0.8s)"), 0.8)
-    time.sleep(delay)
-    next_hour = (st.session_state.current_hour + 1) % 24
-    st.session_state.current_hour = next_hour
-    if next_hour == 0:
-        st.session_state.playing = False  # stop after one full 24-hour cycle
+    _speed_map = {"遅い (1.5s)": 1.5, "普通 (0.8s)": 0.8, "速い (0.3s)": 0.3}
+    _delay = _speed_map.get(
+        st.session_state.get("anim_speed", "普通 (0.8s)"), 0.8
+    )
+    time.sleep(_delay)
+    _next = (st.session_state.current_hour + 1) % 24
+    st.session_state.current_hour = _next
+    if _next == 0:
+        st.session_state.playing = False  # stop after one full 24-h cycle
     st.rerun()

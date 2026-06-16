@@ -46,3 +46,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local data cache (Japan geometry + municipalities)
+.cache/
